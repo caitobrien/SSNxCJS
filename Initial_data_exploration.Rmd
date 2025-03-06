@@ -1,0 +1,283 @@
+---
+title: "Initial exploratory analysis"
+---
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(here)
+library(sf)
+```
+# Initial Scope
+This beginning project aims to apply SSN predicted temperatures to release/tag locations of wild spring/summer chinook salmon. Based on the area of release, I hope to map certain MPGs or origin histories per fish and then apply temperature as an indice of their early life experience that might influence survival downstream. 
+
+
+# Data
+
+## Fish
+- This data includes any PIT tagged wild spring/summer fish with a release/tag location in the Columbia River Basin.
+
+```{r}
+#initial load of data
+
+fish_raw<-read_csv(here("dsynth_2024.20240702.spsu.csv"))
+
+#filter to include Wild and Unknown fish
+fish_raw_wild<-fish_raw %>% 
+  filter(t_rear_type != "H")
+rm(fish_raw)
+
+#check how many unknown
+fish_raw_wild %>% 
+  group_by(t_rear_type) %>% 
+  summarise(n=n())
+
+fish_raw_wild %>% 
+  group_by(t_run) %>% 
+  summarise(n=n())
+
+# What does the hatchery column refer too?-- MC answered in email--likely based on hatchery assignment near release location
+fish_raw_wild %>%
+  group_by(t_run) %>%
+  summarize(
+    total_n_hatchery = sum(!is.na(hatchery)),  # Count rows where hatchery is not empty
+    total_n_NA = sum(is.na(hatchery))  # Sum t_run where hatchery is empty
+  )
+```
+
+Adjusted to use matrix search for juv_first since row_wise() method was so slow. 
+```{r matrix search}
+# Define the relevant columns
+juv_cols <- which(names(fish_raw_wild) == "juv_lgr_first"):
+            which(names(fish_raw_wild) == "juv_est_last")
+
+# Convert to matrix for faster processing
+juv_matrix <- as.matrix(fish_raw_wild[, juv_cols])
+
+# Find the first non-NA column index for each row
+first_non_na_idx <- max.col(!is.na(juv_matrix), ties.method = "first")
+
+# Handle cases where all values are NA
+first_non_na_idx[apply(is.na(juv_matrix), 1, all)] <- NA
+
+# Extract the values
+fish_raw_wild$juv_first <- ifelse(is.na(first_non_na_idx), NA, 
+                                  juv_matrix[cbind(1:nrow(juv_matrix), first_non_na_idx)])
+
+# Extract the location from column names
+juv_col_names <- names(fish_raw_wild)[juv_cols]
+fish_raw_wild$juv_first_location <- ifelse(is.na(first_non_na_idx), NA, 
+                                           sub("juv_([a-z]+)_.*", "\\1", juv_col_names[first_non_na_idx]))
+
+# View results
+head(fish_raw_wild)
+
+#adjust to get year and doy then filter 
+
+fish_filtered <- fish_raw_wild %>%
+  mutate(
+    first_juv_date = as_datetime(first_juv_date, tz = "UTC"),
+    juv_year = year(first_juv_date),
+    juv_doy = yday(first_juv_date)
+  ) %>% 
+  filter(between(juv_doy, 70, 160)) %>% 
+  filter(is.na(length) | between(length, 50, 155))
+
+
+# extract adult first and last
+fish_filtered <- fish_filtered %>%
+  mutate(
+    first_adu_date = apply(select(., adu_bon_first:adu_trb_last), 1, function(x) na.omit(x)[1]),
+    first_adu_date = as_datetime(first_adu_date, tz = "UTC"), 
+    adu_year = year(first_adu_date),
+    adu_doy = yday(first_adu_date)
+  )
+
+# check arrival dates & length
+hist(fish_filtered$juv_doy)
+hist(fish_filtered$length)
+#' have not filtered transportation type or if no detection as juv or doy
+#' How to use mort date, site, age? Seems to know which fish died-- any point in using outside CJS model?
+#' What does total RKM mean? how is it calculated-- from where to where?
+#' 
+
+
+```
+
+
+## SSN temperature
+- Attempted a few methods from the website. Possibly the easiest would be to download the whole geodatabase into QGIS and then select the attributes of interest from there and then use that file for the analysis. Provides a bit more flexibility but option 3 is the easiest in Rstudio for mapping where pred temps and fish match up. 
+
+
+This option was downloading from url: https://www.fs.usda.gov/rm/boise/AWAE/projects/NorWeST/temperature-models-rscript-ssn.html 
+which seems to have observed data but doesn't have predicted data -- has column STREAM_AUG with all -999. Is the file to run for model prediction? Can use with import option 3 for added observation sites to predicted through 2015 map pulled from website. 
+```{r import_option_1}
+
+# Load the stream network (edges)
+edges_data <- st_read(here("Clearwater.ssn/edges.shp"))
+pred_data<- st_read(here("Clearwater.ssn/preds.shp")) #there is no prediction temp (all = -999)-- does this need to be run?
+obs_data <- st_read(here("Clearwater.ssn/sites.shp"))
+
+# Check available columns
+colnames(edges_data)
+colnames(pred_data)
+
+
+# Plot prediction points on stream network
+ggplot() +
+  geom_sf(data = edges_data, color = "lightblue", size = 0.3) +  # Stream network
+  geom_sf(data = obs_data, aes(color = STREAM_AUG), size = 1) +  # Observation points
+  # geom_sf(data = pred_data, aes(color = STREAM_AUG), size = 1) +  # Prediction points
+  scale_color_viridis_c(option = "magma", name = "Predicted Temp (°C)") +
+  theme_minimal() +
+  facet_wrap(~SAMPLEYEAR) +
+  labs(title = "Stream Temperature at Observation sites (1993:2011)",
+       subtitle = "Clearwater Basin (NorWeST)")
+
+```
+
+Can get prediction data from NorWeST Stream Temperature Maps _ this works and is flexible in region selected-- gives predicted, observed, and future scenarios.
+```{r import_option_2}
+#output
+mean_aug<-st_read(here("appoutput/Mean_August_Stream_Temperature_(S1__1993-2011).shp"))
+obs_pts<- st_read(here("appoutput/Observed_Temperature_Points.shp"))
+
+# Check available columns
+colnames(mean_aug)
+colnames(obs_pts)
+
+
+points_sf <- st_cast(mean_aug, "POINT")
+
+ggplot() +
+  geom_sf(data = mean_aug, aes(color = S1_93_11)) +  # Plot lines
+  geom_sf(data = obs_pts, color = "black", size = .5) +  # Plot points
+    scale_color_viridis_c(option = "magma", name = "Predicted Temp (°C)") +
+  theme_minimal()
+```
+This option works for predicted in stream lines or points. Not sure if it includes observed data points-- not clear. Can download by HUC and use observation data from different files if needed.
+downloaded from url : https://www.fs.usda.gov/rm/boise/AWAE/projects/NorWeST/ModeledStreamTemperatureScenarioMaps.shtml
+
+Need to look into scenarios and how to use them. Seem to have S1: 93-11 and S2: 02-11, then S3:S21 are single years from 1993 to 2011, then there are some future scenarios and predse and then more predictions for additinal years S33:S36- 2012-2015. Doesn't look like those are included in any of the scenario predicted temps across years (S1 and S2). 
+```{r import_option_3}
+pred_lines<-st_read(here("NorWeST_PredictedStreamTempLines_Clearwater/NorWeST_PredictedStreamTempLines_Clearwater.shp"))
+st_crs(pred_lines)
+glimpse(pred_lines)
+pred_points<-st_read(here("NorWeST_PredictedStreamTempPoints_Clearwater/NorWeST_PredictedStreamTempPoints_Clearwater.shp"))
+# st_crs(pred_points)
+colnames(pred_lines)
+ggplot() +
+  geom_sf(data = pred_lines, aes(color = S2_02_11)) +  
+    scale_color_viridis_c(option = "magma", name = "Predicted Temp (°C)") +
+  geom_sf(data = obs_pts, color = "forestgreen", size = .5) +  # Plot points from option 1 observation points
+  # geom_sf(data = pred_points, size = .5) + 
+  theme_minimal()
+
+
+
+```
+
+
+# Fish x SSN
+Looking at possible ways to combine fish and temperature 
+- get rel_time - tag-time = time spent @ location to be exposed to temperatures
+- get rel_time - arrival to LGR = time spent in river to be exposed to temperatures from Release site to LGR
+-get a lat/log for release sites
+
+```{r manual_join_latlong}
+mrr_sites<-read_csv(here("PTAGISMRRSites.csv")) %>% 
+             janitor::clean_names() 
+
+
+
+# Renaming based on the last part of rel_rkm and handling missing third part
+fish_data_renamed <- fish_filtered %>%
+  mutate(last_rkm_part = case_when(
+    str_count(rel_rkm, "\\.") == 1 ~ 0,  # If only 1 seperator, set last_rkm_part to 0
+    TRUE ~ as.numeric(sub(".*\\.(\\d+)$", "\\1", rel_rkm))  # Extract the numeric part after the last dot for three parts
+  ),
+  renamed_rel_site = case_when(
+    #GRANDR 522.271.326 and 522.271.327 do not seem to have a designation-- remove from set or reassign? removes about 26 entries
+    grepl("^GRANDR", rel_site) & last_rkm_part >= 0 & last_rkm_part <= 131 ~ "GRAND1",  # RKM range 0 to 131 for GRANDR
+    grepl("^GRANDR", rel_site) & last_rkm_part >= 132 & last_rkm_part <= 325 ~ "GRAND2",  # RKM range 132 to 325 for GRANDR
+    grepl("^GRANDR", rel_site) & last_rkm_part == 320 ~ "GRANDP",  # Specific RKM for GRANDP pond
+    grepl("^GRANDR", rel_site) & last_rkm_part == 291 ~ "GRANDW",  # Specific RKM for GRANDW wier
+   #SALR with rkm past 522.303 (in year 1989), can not be designated -- consider removing from set. Right now it replaces with 0 and renames SALR1. Should be the warmest temperature assignment since downstream? n = 133 entries
+    grepl("^SALR", rel_site) & last_rkm_part >= 0 & last_rkm_part <= 171 ~ "SALR1",  # RKM range 0 to 171 for SALR
+    grepl("^SALR", rel_site) & last_rkm_part >= 172 & last_rkm_part <= 319 ~ "SALR2",  # RKM range 171 to 319 for SALR
+    grepl("^SALR", rel_site) & last_rkm_part >= 320 & last_rkm_part <= 489 ~ "SALR3",  # RKM range 319 to 489 for SALR
+    grepl("^SALR", rel_site) & last_rkm_part >= 490 & last_rkm_part <= 650 ~ "SALR4",  # RKM range 489 to 650 for SALR
+    rel_site == "WHITSC" ~ "COLTKC",  # Specific rel_site naming change
+    TRUE ~ as.character(rel_site)  # Keep original if no match
+  )) 
+
+
+#join MRR site info
+fish_latlong<- fish_data_renamed %>% 
+    left_join(mrr_sites , by = c("renamed_rel_site" = "mrr_site_info_code"))
+
+#check any sites missing assignment
+fish_latlong_missing<- fish_latlong %>%
+  filter(is.na(mrr_site_longitude_value) & is.na(mrr_site_latitude_value)) %>%
+  group_by(renamed_rel_site, rel_rkm) %>%
+  summarise(n())
+
+#select only the columns of interest for mapping
+fish_latlong<- fish_latlong %>% 
+  select("tag_id","renamed_rel_site", "rel_rkm" , "juv_year", "juv_first_location", "adu_year",  "mrr_site_info_name","mrr_site_info_rkm_mask",   "mrr_site_type_name",       "mrr_site_subbasin_code",   "mrr_site_subbasin_name",   "mrr_site_latitude_value",  "mrr_site_longitude_value") %>% 
+  drop_na(mrr_site_longitude_value, mrr_site_latitude_value) #drops GRANDR sites rkm 326 and 327 for now-- could probably figure out how to keep. 
+
+
+
+# Convert fish data to sf object -- check lat/long formatting first
+fish_sf <- st_as_sf(fish_latlong, coords = c("mrr_site_longitude_value",  "mrr_site_latitude_value"), crs = 4326) %>% 
+  st_transform(crs = st_crs(pred_lines))
+```
+
+```{r}
+fish_counts <- fish_sf %>% 
+  group_by(renamed_rel_site, geometry) %>% 
+  summarise(nfish = n())
+
+#if pulliing out data to use in QGIS-- easier to see map and prediction points that overlap with fish release sites
+# Step 1: Save the shapefile
+st_write(fish_counts, "fish_counts.shp", delete_dsn = TRUE)
+
+# Step 2: Zip the shapefile components
+zip("fish_counts.zip", c("fish_counts.shp", "fish_counts.shx", "fish_counts.dbf", "fish_counts.prj"))
+
+
+
+ggplot() +
+  geom_sf(data = pred_lines, aes(color = S2_02_11)) +  
+    scale_color_viridis_c(option = "magma", name = "Predicted Temp (°C)") +
+  # geom_sf(data = obs_pts, color = "forestgreen", size = .5) +  # Plot points
+  geom_sf(data = fish_counts, aes(size = nfish), color = "salmon") +  # Plot fish points
+  scale_size_continuous(name = "Number of Fish",
+                        range = c(1,8),
+                        breaks = seq(0, 300000, by = 25,000)
+                        ) +
+    ggrepel::geom_label_repel(
+    data = fish_counts, 
+    aes(label = paste0(renamed_rel_site, ", n: ", nfish), geometry = geometry), 
+    stat = "sf_coordinates",  # Ensures labels are placed at geometry points
+    min.segment.length = 0,
+    max.overlaps = Inf
+  ) +
+  theme_minimal()
+
+```
+
+workin QGIS to join fish and temp to bring in as points
+
+```{r}
+
+merged_df<-read.csv(here("QGIS/joined_fish_temp_point.csv"))
+
+merged_df
+#' next step get use joined temperature prediction data and reassign to rel_site per fish, aggregate fish by detection history, and then run basic CJS with temperature and transport as covariates by reaches.
+  
+```
+
+
+
